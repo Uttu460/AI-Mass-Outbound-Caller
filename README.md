@@ -1,110 +1,73 @@
-# LiveKit Vobiz Outbound Agent 📞
+# OutboundAI
 
-A production-ready voice agent capable of making outbound calls using **LiveKit**, **Deepgram**, and **Groq (Llama 3.3)**.  
-Designed for reliability, speed, and ease of deployment.
+OutboundAI is a Docker-deployed outbound voice calling platform built around LiveKit, Gemini Live, Twilio SIP trunking, Supabase CRM, and Cal.com scheduling.
 
-## 🚀 Features
-- **Ultra-Fast LLM**: Uses **Groq** running `llama-3.3-70b-versatile` for near-instant responses.
-- **High-Quality Audio**: Uses **Deepgram** for both Speech-to-Text (STT) and Text-to-Speech (TTS).
-- **SIP Trunking**: Integrated with **Vobiz** for PSTN connectivity.
-- **Robust Configuration**: Centralized `config.py` for easy customization of prompts, models, and voices.
+## Deployment mode
 
----
+This repository is now configured for env-only runtime configuration:
+- The VPS or Coolify environment variables are the only source of truth.
+- `.env` is not loaded at runtime.
+- `.env` is excluded from Docker build context.
+- Dashboard settings writes are intentionally disabled.
 
-## 🛠️ Setup & Installation
+## Hostinger VPS + Coolify
 
-### 1. Prerequisites
-- Python 3.10+ (Recommended: 3.10.13)
-- A [LiveKit Cloud](https://cloud.livekit.io/) account
-- A [Deepgram](https://deepgram.com/) API Key
-- A [Groq](https://groq.com/) API Key
-- A SIP Provider (e.g., Vobiz)
+1. Create a new application in Coolify from this repository.
+2. Keep the detected `Dockerfile`.
+3. Set the public port to `8000`.
+4. Add a health check path of `/health`.
+5. Add all required environment variables from `.env.example` into Coolify.
+6. Deploy.
 
-### 2. Clone & Install
-```bash
-# Clone the repository
-git clone <your-repo-url>
-cd LiveKit-Vobiz-Outbound-main
+## Required environment variables
 
-# Create a virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+These are required for startup:
+- `LIVEKIT_URL`
+- `LIVEKIT_API_KEY`
+- `LIVEKIT_API_SECRET`
+- `GOOGLE_API_KEY`
+- `TWILIO_TRUNK_SID`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+- `CALCOM_API_KEY`
+- `CALCOM_BOOKING_URL`
+- `CALCOM_TIMEZONE`
 
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 3. Configure Environment
-Copy the example environment file and fill in your credentials:
-```bash
-cp .env.example .env
-nano .env  # Or open in your editor
-```
-**Required Variables:**
-- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_SECRET`
+Optional but commonly needed:
+- `SYSTEM_PROMPT`
+- `ENABLED_TOOLS`
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_FROM_NUMBER`
+- `DEFAULT_TRANSFER_NUMBER`
+- `S3_ACCESS_KEY_ID`
+- `S3_SECRET_ACCESS_KEY`
+- `S3_ENDPOINT_URL`
+- `S3_REGION`
+- `S3_BUCKET`
 - `DEEPGRAM_API_KEY`
-- `GROQ_API_KEY`
-- `VOBIZ_SIP_*` variables (for outbound calls)
 
----
+## Startup behavior
 
-## 🏃‍♂️ Usage
+- `start.sh` validates required environment variables before the app starts.
+- FastAPI is served on port `8000`.
+- `/health` returns HTTP 200 for container health checks.
+- If required environment variables are missing, the container exits immediately with a clear error.
 
-### 1. Start the Agent
-This runs the agent process which listens for room connections.
-```bash
-python agent.py start
-```
+## Supabase
 
-### 2. Make an Outbound Call
-In a **new terminal window** (ensure `venv` is active), run:
-```bash
-python make_call.py --to +91XXXXXXXXXX
-```
-*Note: The number must include the country code (e.g., +1 or +91).*
+Run `supabase_schema.sql` once in your Supabase SQL editor before first production use.
 
----
+## Cal.com scheduling
 
-## 🔧 Troubleshooting Guide
+Cal.com is the primary scheduling engine:
+- real availability is checked from Cal.com
+- bookings are created in Cal.com first
+- bookings are then mirrored into Supabase for CRM and reporting
 
-### ❌ Error: `model_decommissioned` (Groq/Llama)
-**Cause:** The configured LLM model is no longer supported by Groq.  
-**Fix:**
-1. Open `config.py`.
-2. Update `GROQ_MODEL` to a supported model (e.g., `llama-3.3-70b-versatile` or `llama-3.1-8b-instant`).
-3. **Restart `agent.py`** to apply changes.
+If Cal.com fails, the app logs the error and falls back to CRM-only booking.
 
-### ❌ Error: `404 Not Found` (SIP Trunk)
-**Cause:** The `SIP_TRUNK_ID` in `.env` is incorrect or doesn't exist in your LiveKit project.  
-**Fix:**
-1. Run `python list_trunks.py` to see available trunks.
-2. If none exist, run `python create_trunk.py` to create one.
-3. Update `.env` with the correct ID.
+## Notes
 
-### ❌ Error: `Address already in use` (Port 8081)
-**Cause:** Another instance of `agent.py` is already running.  
-**Fix:**
-1. Find the process: `lsof -i :8081`
-2. Kill it: `kill -9 <PID>` or `pkill -f "python agent.py"`
-
-### ❌ Error: `No module named 'certifi'` or other imports
-**Cause:** Dependencies are missing.  
-**Fix:**
-1. Ensure your virtual environment is active (`source venv/bin/activate`).
-2. Run `pip install -r requirements.txt`.
-
-### ❌ Call Connects but No Audio
-**Cause:** TTS (Text-to-Speech) failure or WebSocket issues.  
-**Fix:**
-1. Check terminal logs for `APIStatusError`.
-2. If using OpenAI TTS, ensure you have OpenAI credits.
-3. Recommended: Switch to Deepgram TTS (set `TTS_PROVIDER=deepgram` in `.env`).
-
----
-
-## 📂 Project Structure
-- `agent.py`: Main application logic.
-- `config.py`: Central configuration for prompts, models, and constants.
-- `make_call.py`: Script to initiate outbound calls.
-- `create_trunk.py` / `setup_trunk.py`: Utilities for SIP trunk management.
-# LIvekitAIVoice
+- The dashboard still displays config values, but edits are blocked because runtime configuration is env-managed.
+- Agent profiles, campaigns, CRM data, call logs, and appointments remain stored in Supabase.
