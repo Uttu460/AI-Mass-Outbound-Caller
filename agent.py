@@ -67,42 +67,67 @@ except ImportError:
     logger.warning("Google or Deepgram plugins not installed")
 
 
+def _log_package_versions() -> None:
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        for pkg in (
+            "livekit-agents",
+            "livekit-api",
+            "livekit-plugins-google",
+            "livekit-plugins-deepgram",
+            "livekit-plugins-silero",
+            "google-genai",
+        ):
+            try:
+                logger.info(f"[VERSIONS] {pkg}=={version(pkg)}")
+            except PackageNotFoundError:
+                logger.warning(f"[VERSIONS] {pkg} NOT INSTALLED")
+    except Exception as exc:
+        logger.warning(f"[VERSIONS] could not enumerate: {exc}")
+
+
+# Models known to be incompatible with generate_reply() / update_instructions().
+# Per https://docs.livekit.io/agents/models/realtime/plugins/gemini/#gemini-31-compatibility
+# Gemini 3.1 silently ignores generate_reply() and the AI never speaks first.
+_BAD_REALTIME_MODELS = ("gemini-3.1",)
+_DEFAULT_REALTIME_MODEL = "gemini-2.0-flash-live-001"
+
+
+def _resolve_model(requested: str) -> str:
+    if not requested:
+        return _DEFAULT_REALTIME_MODEL
+    for bad in _BAD_REALTIME_MODELS:
+        if bad in requested:
+            logger.warning(
+                f"[BUILD] Requested model '{requested}' has known generate_reply() incompatibility. "
+                f"Auto-switching to '{_DEFAULT_REALTIME_MODEL}'."
+            )
+            return _DEFAULT_REALTIME_MODEL
+    return requested
+
+
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
-    # NOTE: 'gemini-2.0-flash-live-001' is NOT a real model. Valid Gemini Live models include:
-    #   - gemini-2.0-flash-live-001
-    #   - gemini-2.0-flash-exp
-    #   - gemini-live-2.5-flash-preview
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-live-001")
-    gemini_voice = os.getenv("GEMINI_TTS_VOICE", "Aoede")
+    requested_model = os.getenv("GEMINI_MODEL", _DEFAULT_REALTIME_MODEL)
+    gemini_model = _resolve_model(requested_model)
+    gemini_voice = os.getenv("GEMINI_TTS_VOICE", "Puck")
     use_realtime = os.getenv("USE_GEMINI_REALTIME", "true").lower() != "false"
+    # Prefer the stable google.realtime.RealtimeModel over google.beta.realtime.RealtimeModel
     realtime_class = _google_realtime or (_google_beta_realtime if use_realtime else None)
     logger.info(f"[BUILD] gemini_model={gemini_model} voice={gemini_voice} use_realtime={use_realtime} realtime_class={realtime_class!r}")
     logger.info(f"[BUILD] tools count={len(tools)} system_prompt_len={len(system_prompt)}")
 
     if use_realtime and realtime_class is not None:
-        try:
-            from google.genai import types as _gt
-
-            realtime_kwargs = {
-                "model": gemini_model,
-                "voice": gemini_voice,
-                "instructions": system_prompt,
-                "realtime_input_config": _gt.RealtimeInputConfig(
-                    automatic_activity_detection=_gt.AutomaticActivityDetection(
-                        end_of_speech_sensitivity=_gt.EndSensitivity.END_SENSITIVITY_LOW,
-                        silence_duration_ms=2000,
-                        prefix_padding_ms=200,
-                    )
-                ),
-                "session_resumption": _gt.SessionResumptionConfig(transparent=True),
-                "context_window_compression": _gt.ContextWindowCompressionConfig(
-                    trigger_tokens=25600,
-                    sliding_window=_gt.SlidingWindow(target_tokens=12800),
-                ),
-            }
-        except Exception as exc:
-            logger.warning(f"[BUILD] google.genai types unavailable, falling back to minimal kwargs: {exc}")
-            realtime_kwargs = {"model": gemini_model, "voice": gemini_voice, "instructions": system_prompt}
+        # Match the OFFICIAL minimal-kwargs pattern from
+        # https://docs.livekit.io/agents/models/realtime/plugins/gemini/
+        # Adding session_resumption / context_window_compression / realtime_input_config
+        # has been observed to destabilize the transport on some plugin versions.
+        realtime_kwargs = {
+            "model": gemini_model,
+            "voice": gemini_voice,
+            "instructions": system_prompt,
+            "temperature": 0.8,
+        }
+        logger.info(f"[BUILD] Realtime kwargs keys: {list(realtime_kwargs.keys())}")
         logger.info(f"[BUILD] Instantiating realtime LLM: {realtime_class.__module__}.{realtime_class.__name__}")
         try:
             llm = realtime_class(**realtime_kwargs)
@@ -374,6 +399,51 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if hasattr(session, attr):
                 await _log("error", f"[SESSION] final session.{attr} = {getattr(session, attr)!r}")
 
+    # Set up shutdown event early so the health monitor can observe it via closure.
+    done = asyncio.Event()
+
+    # ===== Background watchdog: monitor _started flag and any internal task crashes =====
+    async def _session_health_monitor():
+        last_started = None
+        last_state = None
+        reported_tasks: set = set()
+        while not done.is_set():
+            try:
+                started_now = getattr(session, "_started", None)
+                if started_now != last_started:
+                    logger.warning(f"[HEALTH] session._started transition: {last_started} -> {started_now}")
+                    last_started = started_now
+                state_now = getattr(session, "state", None)
+                if state_now is not None and state_now != last_state:
+                    logger.warning(f"[HEALTH] session.state transition: {last_state} -> {state_now}")
+                    last_state = state_now
+                # Check internal tasks for completion / exception
+                for task_attr in ("_main_task", "_task", "_session_task", "_run_task"):
+                    t = getattr(session, task_attr, None)
+                    if t is not None and hasattr(t, "done") and t.done() and task_attr not in reported_tasks:
+                        reported_tasks.add(task_attr)
+                        try:
+                            exc = t.exception()
+                            if exc is not None:
+                                logger.error(f"[HEALTH] session.{task_attr} CRASHED: {type(exc).__name__}: {exc}")
+                                logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                            else:
+                                logger.warning(f"[HEALTH] session.{task_attr} completed without exception (task is now done)")
+                        except asyncio.CancelledError:
+                            logger.warning(f"[HEALTH] session.{task_attr} was cancelled")
+                        except asyncio.InvalidStateError:
+                            pass
+                        except Exception as exc:
+                            logger.warning(f"[HEALTH] error inspecting {task_attr}: {exc}")
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning(f"[HEALTH] monitor error: {exc}")
+                await asyncio.sleep(2.0)
+
+    health_task = asyncio.create_task(_session_health_monitor())
+
     # Always trigger first reply so the AI speaks first.
     # Realtime models like gemini-2.0-flash-live-001 also need this kick-off,
     # otherwise they sit silent waiting for user audio.
@@ -383,11 +453,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
     max_attempts = 5
     backoff = 0.5
+    greeted = False
     for attempt in range(1, max_attempts + 1):
         try:
             await _log("info", f"[SESSION] generate_reply() attempt {attempt}/{max_attempts}")
             await session.generate_reply(instructions=greet_instructions)
             await _log("info", "[SESSION] Initial generate_reply() returned successfully")
+            greeted = True
             break
         except RuntimeError as exc:
             msg = str(exc).lower()
@@ -402,10 +474,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             await _log("warning", f"[SESSION] generate_reply failed (attempt {attempt}): {exc}", traceback.format_exc())
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 4.0)
-    else:
-        await _log("error", f"[SESSION] generate_reply() never succeeded after {max_attempts} attempts")
 
-    done = asyncio.Event()
+    # Fallback: if generate_reply() never worked, try session.say() with a hardcoded greeting.
+    if not greeted:
+        await _log("warning", "[SESSION] generate_reply() exhausted - falling back to session.say()")
+        try:
+            if hasattr(session, "say"):
+                fallback_text = f"Hey, are you from {business_name}?"
+                await session.say(fallback_text)
+                await _log("info", f"[SESSION] session.say() fallback succeeded: {fallback_text!r}")
+            else:
+                await _log("error", "[SESSION] session has no .say() method - no fallback available")
+        except Exception as exc:
+            await _log("error", f"[SESSION] session.say() fallback also failed: {exc}", traceback.format_exc())
 
     def _on_participant_disconnected(participant: rtc.RemoteParticipant):
         if sip_identity and participant.identity == sip_identity:
@@ -507,6 +588,7 @@ if __name__ == "__main__":
     print(f"[BOOT] GEMINI_MODEL={os.getenv('GEMINI_MODEL', '<unset>')}", flush=True)
     print(f"[BOOT] USE_GEMINI_REALTIME={os.getenv('USE_GEMINI_REALTIME', 'true')}", flush=True)
     print("=" * 60, flush=True)
+    _log_package_versions()
 
     # Verbose logging for diagnostics
     logging.getLogger("livekit").setLevel(logging.INFO)
