@@ -164,6 +164,8 @@ async def insert_appointment(
     calcom_booking_uid: Optional[str] = None,
     timezone: str = "America/Chicago",
     synced_to_calcom: bool = False,
+    booking_source: str = "calcom",
+    status: str = "booked",
 ) -> str:
     full_id = str(uuid.uuid4())
     db = await _adb()
@@ -174,10 +176,11 @@ async def insert_appointment(
         "date": date,
         "time": time,
         "service": service,
-        "status": "booked",
+        "status": status,
         "created_at": datetime.now().isoformat(),
         "timezone": timezone,
         "synced_to_calcom": 1 if synced_to_calcom else 0,
+        "booking_source": booking_source,
     }
     if calcom_booking_uid:
         row["calcom_booking_uid"] = calcom_booking_uid

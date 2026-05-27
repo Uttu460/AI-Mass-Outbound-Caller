@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import ssl
+import time as _time
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +74,25 @@ except ImportError:
     _scheduler = None
 
 app = FastAPI(title="OutboundAI Dashboard", version="1.0.0")
+
+# --- Duplicate call prevention ---
+_active_calls: dict[str, float] = {}  # phone -> dispatch timestamp
+_CALL_COOLDOWN_SECONDS = 60
+
+
+def _is_call_locked(phone: str) -> bool:
+    last = _active_calls.get(phone)
+    if last is None:
+        return False
+    return (_time.time() - last) < _CALL_COOLDOWN_SECONDS
+
+
+def _lock_call(phone: str) -> None:
+    _active_calls[phone] = _time.time()
+
+
+def _release_call(phone: str) -> None:
+    _active_calls.pop(phone, None)
 
 
 class CallRequest(BaseModel):
@@ -178,6 +198,8 @@ async def api_dispatch_call(req: CallRequest):
     phone = req.phone.strip()
     if not phone.startswith("+"):
         raise HTTPException(400, "Phone must be in E.164 format: +919876543210")
+    if _is_call_locked(phone):
+        raise HTTPException(429, f"Call to {phone} already in progress or recently dispatched. Please wait {_CALL_COOLDOWN_SECONDS}s.")
     effective_prompt = req.system_prompt
     effective_voice = None
     effective_model = None
@@ -205,7 +227,15 @@ async def api_dispatch_call(req: CallRequest):
         metadata["model_override"] = effective_model
     if effective_tools:
         metadata["tools_override"] = effective_tools
-    return await _dispatch_call(metadata)
+    _lock_call(phone)
+    try:
+        result = await _dispatch_call(metadata)
+    except Exception as exc:
+        _release_call(phone)
+        raise exc
+    # Auto-release after cooldown
+    asyncio.get_event_loop().call_later(_CALL_COOLDOWN_SECONDS, _release_call, phone)
+    return result
 
 
 @app.get("/api/calls")
@@ -414,7 +444,9 @@ async def _run_campaign(campaign_id: str) -> None:
     fail_count = 0
     try:
         for idx, contact in enumerate(contacts):
-            if contact.get("phone", "").startswith("+") and await _dispatch_one(lk, lk_api, contact, campaign.get("system_prompt"), profile):
+            phone = contact.get("phone", "")
+            if phone.startswith("+") and not _is_call_locked(phone) and await _dispatch_one(lk, lk_api, contact, campaign.get("system_prompt"), profile):
+                _lock_call(phone)
                 ok_count += 1
             else:
                 fail_count += 1

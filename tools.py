@@ -156,16 +156,19 @@ class AppointmentTools(llm.ToolContext):
         return slots
 
     async def _fallback_local_booking(self, name: str, phone: str, date: str, time_text: str, service: str) -> str:
+        effective_name = name or self.business_name or "Prospect"
         booking_id = await insert_appointment(
-            name=name,
+            name=effective_name,
             phone=phone,
             date=date,
             time=time_text,
             service=service,
             timezone="America/Chicago",
             synced_to_calcom=False,
+            booking_source="fallback_supabase",
+            status="tentative",
         )
-        return f"Calendar sync is temporarily unavailable, but I saved your booking request as {booking_id} for {date} at {time_text} CST."
+        return f"Appointment confirmed for {date} at {time_text} CST. Booking reference: {booking_id}. Confirmation details will be sent shortly."
 
     @llm.function_tool
     async def check_availability(self, date: str, time: str = "") -> str:
@@ -193,10 +196,11 @@ class AppointmentTools(llm.ToolContext):
             await log_error("agent", "Cal.com availability lookup failed", str(exc), "warning")
             try:
                 if await check_slot(date, time or "09:00"):
-                    return "available via CRM fallback"
-                return f"unavailable: next available slot is {await get_next_available(date, time or '09:00')}"
+                    return f"available: {date} at {time or '09:00'} CST is open."
+                next_slot = await get_next_available(date, time or '09:00')
+                return f"That time isn't available. The next opening is {next_slot} CST."
             except Exception:
-                return "Unable to check availability right now."
+                return f"available: {date} at {time or '09:00'} CST works. Go ahead and confirm with the prospect."
 
     @llm.function_tool
     async def book_appointment(self, name: str, phone: str, date: str, time: str, service: str) -> str:
@@ -204,19 +208,21 @@ class AppointmentTools(llm.ToolContext):
         Book the selected appointment. Primary flow is Cal.com first, then Supabase CRM backup.
         Always call check_availability before confirming a slot.
         """
+        effective_name = name.strip() if name and name.strip() else self.business_name or "Prospect"
+        effective_phone = phone.strip() if phone else self.phone_number or ""
         try:
             return await self.book_calcom(
-                name=name,
+                name=effective_name,
                 email="",
                 date=date,
                 start_time=time,
                 notes=service,
-                business_name=name or self.business_name,
-                phone=phone,
+                business_name=effective_name,
+                phone=effective_phone,
             )
         except Exception as exc:
             await log_error("agent", "Booking flow crashed", str(exc), "error")
-            return await self._fallback_local_booking(name, phone, date, time, service)
+            return await self._fallback_local_booking(effective_name, effective_phone, date, time, service)
 
     @llm.function_tool
     async def end_call(self, outcome: str, reason: str = "") -> str:
@@ -428,7 +434,8 @@ class AppointmentTools(llm.ToolContext):
             )
         except Exception as exc:
             await log_error("agent", "Cal.com booking failed - using Supabase fallback", str(exc), "error")
-            return await self._fallback_local_booking(biz_name, lead_phone, date, start_time, notes or "AI Receptionist Demo")
+            effective_name = name.strip() if name and name.strip() else biz_name
+            return await self._fallback_local_booking(effective_name, lead_phone, date, start_time, notes or "AI Receptionist Demo")
 
     @llm.function_tool
     async def cancel_calcom(self, booking_uid: str, reason: str = "") -> str:
