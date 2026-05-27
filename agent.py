@@ -68,10 +68,16 @@ except ImportError:
 
 
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+    # NOTE: 'gemini-2.0-flash-live-001' is NOT a real model. Valid Gemini Live models include:
+    #   - gemini-2.0-flash-live-001
+    #   - gemini-2.0-flash-exp
+    #   - gemini-live-2.5-flash-preview
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-live-001")
     gemini_voice = os.getenv("GEMINI_TTS_VOICE", "Aoede")
     use_realtime = os.getenv("USE_GEMINI_REALTIME", "true").lower() != "false"
     realtime_class = _google_realtime or (_google_beta_realtime if use_realtime else None)
+    logger.info(f"[BUILD] gemini_model={gemini_model} voice={gemini_voice} use_realtime={use_realtime} realtime_class={realtime_class!r}")
+    logger.info(f"[BUILD] tools count={len(tools)} system_prompt_len={len(system_prompt)}")
 
     if use_realtime and realtime_class is not None:
         try:
@@ -94,10 +100,25 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
                     sliding_window=_gt.SlidingWindow(target_tokens=12800),
                 ),
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[BUILD] google.genai types unavailable, falling back to minimal kwargs: {exc}")
             realtime_kwargs = {"model": gemini_model, "voice": gemini_voice, "instructions": system_prompt}
-        return AgentSession(llm=realtime_class(**realtime_kwargs), tools=tools)
+        logger.info(f"[BUILD] Instantiating realtime LLM: {realtime_class.__module__}.{realtime_class.__name__}")
+        try:
+            llm = realtime_class(**realtime_kwargs)
+            logger.info(f"[BUILD] Realtime LLM instantiated: {llm!r}")
+        except Exception:
+            logger.error(f"[BUILD] Realtime LLM instantiation FAILED:\n{traceback.format_exc()}")
+            raise
+        try:
+            session = AgentSession(llm=llm, tools=tools)
+            logger.info(f"[BUILD] AgentSession created with realtime LLM")
+            return session
+        except Exception:
+            logger.error(f"[BUILD] AgentSession() FAILED:\n{traceback.format_exc()}")
+            raise
 
+    logger.info("[BUILD] Building NON-realtime AgentSession (Deepgram STT + Google LLM + Google TTS)")
     stt = _deepgram_stt(model="nova-3", language="multi") if _deepgram_stt else None
     tts = _google_tts() if _google_tts else None
     return AgentSession(stt=stt, llm=_google_llm(model="gemini-2.0-flash"), tts=tts, vad=silero.VAD.load(), tools=tools)
@@ -113,6 +134,21 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await _log("info", f"[STARTUP] LiveKit URL: {os.getenv('LIVEKIT_URL', '<unset>')}")
     await _log("info", f"[STARTUP] GEMINI_MODEL: {os.getenv('GEMINI_MODEL', '<unset>')}")
     await _log("info", f"[STARTUP] USE_GEMINI_REALTIME: {os.getenv('USE_GEMINI_REALTIME', 'true')}")
+    await _log("info", f"[STARTUP] GOOGLE_API_KEY set: {bool(os.getenv('GOOGLE_API_KEY'))}")
+
+    # Install a global asyncio exception handler so silently-failing background tasks surface in logs.
+    loop_for_handler = asyncio.get_event_loop()
+
+    def _async_exception_handler(loop, context):
+        msg = context.get("exception") or context.get("message")
+        logger.error(f"[ASYNCIO_EXC] Unhandled exception in background task: {msg!r}")
+        exc = context.get("exception")
+        if exc:
+            logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        if "future" in context:
+            logger.error(f"[ASYNCIO_EXC] future={context['future']!r}")
+
+    loop_for_handler.set_exception_handler(_async_exception_handler)
     phone_number: Optional[str] = None
     lead_name = "there"
     business_name = "our company"
@@ -203,37 +239,66 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             "agent": OutboundAssistant(instructions=system_prompt),
             "room_input_options": RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
         }
+    # Snapshot session attribute surface for diagnostics
+    interesting_attrs = [a for a in dir(session) if not a.startswith("__") and any(
+        k in a.lower() for k in ("start", "running", "state", "ready", "close", "task")
+    )]
+    await _log("info", f"[SESSION] Pre-start interesting attrs: {interesting_attrs}")
+
     try:
-        await _log("info", "[SESSION] Calling session.start()...")
-        await session.start(**session_kwargs)
-        await _log("info", "[SESSION] session.start() returned")
+        await _log("info", "[SESSION] >>> Calling session.start() (with 30s hang timeout) <<<")
+        try:
+            await asyncio.wait_for(session.start(**session_kwargs), timeout=30.0)
+        except asyncio.TimeoutError:
+            await _log("error", "[SESSION] session.start() HUNG for 30s - giving up")
+            raise
+        await _log("info", "[SESSION] session.start() returned cleanly")
     except Exception as exc:
-        await _log("error", "[SESSION] session.start() FAILED", traceback.format_exc())
+        await _log("error", f"[SESSION] session.start() FAILED: {type(exc).__name__}: {exc}", traceback.format_exc())
         raise
 
+    # Dump session state for diagnostics
+    try:
+        for attr in ("state", "is_running", "_started", "_running", "started", "_closed", "_main_task", "_task"):
+            if hasattr(session, attr):
+                val = getattr(session, attr)
+                await _log("info", f"[SESSION] post-start session.{attr} = {val!r}")
+    except Exception as exc:
+        await _log("warning", f"[SESSION] Could not introspect session state: {exc}")
+
     # ===== WAIT UNTIL THE SESSION IS ACTUALLY RUNNING =====
-    async def _wait_session_ready(timeout: float = 10.0) -> bool:
+    async def _wait_session_ready(timeout: float = 15.0) -> bool:
         deadline = time.time() + timeout
+        last_seen = None
         while time.time() < deadline:
-            # Probe a few common readiness attributes across livekit-agents versions
             for attr in ("is_running", "_started", "_running", "started"):
                 val = getattr(session, attr, None)
                 if isinstance(val, bool) and val:
+                    logger.info(f"[SESSION] readiness confirmed via session.{attr}=True")
                     return True
                 if hasattr(val, "is_set") and val.is_set():
+                    logger.info(f"[SESSION] readiness confirmed via session.{attr}.is_set()")
                     return True
-            # No reliable attribute? Just give it a tick.
-            await asyncio.sleep(0.1)
-            # If no detectable readiness flag exists, assume ready after one tick
-            if not any(hasattr(session, a) for a in ("is_running", "_started", "_running", "started")):
+            state = getattr(session, "state", None)
+            if state is not None and str(state) != last_seen:
+                logger.info(f"[SESSION] state transition: {state!r}")
+                last_seen = str(state)
+                if "running" in str(state).lower() or "active" in str(state).lower():
+                    return True
+            await asyncio.sleep(0.2)
+            if not any(hasattr(session, a) for a in ("is_running", "_started", "_running", "started", "state")):
+                logger.info("[SESSION] No readiness attribute found on session - assuming ready")
                 return True
         return False
 
-    ready = await _wait_session_ready(timeout=10.0)
+    ready = await _wait_session_ready(timeout=15.0)
     if ready:
         await _log("info", "[SESSION] AgentSession is RUNNING and ready for input")
     else:
-        await _log("warning", "[SESSION] Could not confirm AgentSession readiness within 10s - continuing anyway")
+        await _log("error", "[SESSION] AgentSession did NOT become ready within 15s")
+        for attr in ("state", "is_running", "_started", "_running", "started", "_main_task", "_task", "_closed"):
+            if hasattr(session, attr):
+                await _log("error", f"[SESSION] final session.{attr} = {getattr(session, attr)!r}")
 
     # ===== NOW DIAL THE OUTBOUND SIP CALL =====
     if phone_number:
@@ -306,7 +371,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 await _log("warning", f"Recording start failed: {exc}")
 
     # Always trigger first reply so the AI speaks first.
-    # Realtime models like gemini-3.1-flash-live-preview also need this kick-off,
+    # Realtime models like gemini-2.0-flash-live-001 also need this kick-off,
     # otherwise they sit silent waiting for user audio.
     greet_instructions = (
         f"The call just connected. Speak first immediately - greet the lead "

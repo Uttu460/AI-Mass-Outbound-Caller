@@ -9,7 +9,7 @@ DEFAULTS = {
     "LIVEKIT_API_KEY": os.getenv("LIVEKIT_API_KEY", ""),
     "LIVEKIT_API_SECRET": os.getenv("LIVEKIT_API_SECRET", ""),
     "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY", ""),
-    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview"),
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-2.0-flash-live-001"),
     "GEMINI_TTS_VOICE": os.getenv("GEMINI_TTS_VOICE", "Aoede"),
     "USE_GEMINI_REALTIME": os.getenv("USE_GEMINI_REALTIME", "true"),
     "TWILIO_ACCOUNT_SID": os.getenv("TWILIO_ACCOUNT_SID", ""),
@@ -363,7 +363,7 @@ async def get_agent_profile(profile_id: str) -> Optional[dict]:
     return result.data if result else None
 
 
-async def create_agent_profile(name: str, voice: str = "Aoede", model: str = "gemini-3.1-flash-live-preview", system_prompt: Optional[str] = None, enabled_tools: str = "[]", is_default: bool = False) -> str:
+async def create_agent_profile(name: str, voice: str = "Aoede", model: str = "gemini-2.0-flash-live-001", system_prompt: Optional[str] = None, enabled_tools: str = "[]", is_default: bool = False) -> str:
     profile_id = str(uuid.uuid4())
     db = await _adb()
     if is_default:
