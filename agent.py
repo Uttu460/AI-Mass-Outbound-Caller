@@ -217,7 +217,80 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     ctx.room.on("participant_connected", _on_participant_connected)
     ctx.room.on("track_subscribed", _on_track_subscribed)
 
-    # ===== BUILD + START THE AGENT SESSION FIRST (before SIP dial) =====
+    # ===== STEP 1: DIAL THE OUTBOUND SIP CALL FIRST =====
+    if phone_number:
+        trunk_id = os.getenv("TWILIO_TRUNK_SID", "") or os.getenv("OUTBOUND_TRUNK_ID", "")
+        if not trunk_id:
+            await _log("error", "[SIP] TWILIO_TRUNK_SID not set - cannot place outbound call")
+            ctx.shutdown()
+            return
+        try:
+            await _log("info", f"[SIP] Dialing {phone_number} via trunk {trunk_id}")
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=phone_number,
+                    participant_identity=sip_identity,
+                    wait_until_answered=True,
+                )
+            )
+            await _log("info", f"[SIP] Call answered by {phone_number}")
+        except Exception as exc:
+            await _log("error", f"[SIP] Dial failed for {phone_number}: {exc}", traceback.format_exc())
+            ctx.shutdown()
+            return
+
+        # ===== STEP 2: WAIT FOR SIP PARTICIPANT TO JOIN THE ROOM =====
+        try:
+            await asyncio.wait_for(sip_participant_joined.wait(), timeout=15.0)
+            await _log("info", f"[ROOM] SIP participant {sip_identity} confirmed in room")
+        except asyncio.TimeoutError:
+            await _log("error", f"[ROOM] SIP participant {sip_identity} did not appear within 15s - aborting")
+            ctx.shutdown()
+            return
+
+        # ===== STEP 3: WAIT FOR SIP AUDIO TRACK SUBSCRIPTION =====
+        try:
+            await asyncio.wait_for(sip_audio_subscribed.wait(), timeout=15.0)
+            await _log("info", "[ROOM] SIP audio track subscribed - audio pipeline ACTIVE")
+        except asyncio.TimeoutError:
+            await _log("warning", "[ROOM] SIP audio track not subscribed within 15s - continuing anyway")
+
+    # ===== STEP 4: START ROOM RECORDING (audio track now exists) =====
+    if phone_number:
+        aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+        aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        aws_bucket = os.getenv("S3_BUCKET", "")
+        s3_endpoint = os.getenv("S3_ENDPOINT_URL", "")
+        s3_region = os.getenv("S3_REGION", "ap-northeast-1")
+        if aws_key and aws_secret and aws_bucket:
+            try:
+                recording_path = f"recordings/{ctx.room.name}.ogg"
+                await ctx.api.egress.start_room_composite_egress(
+                    api.RoomCompositeEgressRequest(
+                        room_name=ctx.room.name,
+                        audio_only=True,
+                        file_outputs=[
+                            api.EncodedFileOutput(
+                                file_type=api.EncodedFileType.OGG,
+                                filepath=recording_path,
+                                s3=api.S3Upload(
+                                    access_key=aws_key,
+                                    secret=aws_secret,
+                                    bucket=aws_bucket,
+                                    region=s3_region,
+                                    endpoint=s3_endpoint,
+                                ),
+                            )
+                        ],
+                    )
+                )
+                tool_ctx.recording_url = f"{s3_endpoint.rstrip('/')}/{aws_bucket}/{recording_path}" if s3_endpoint else f"s3://{aws_bucket}/{recording_path}"
+            except Exception as exc:
+                await _log("warning", f"Recording start failed: {exc}")
+
+    # ===== STEP 5: BUILD THE AGENT SESSION (now that audio pipeline is active) =====
     try:
         session = _build_session(tool_ctx.build_tool_list(enabled_tools), system_prompt)
         await _log("info", "[SESSION] AgentSession built successfully")
@@ -245,6 +318,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )]
     await _log("info", f"[SESSION] Pre-start interesting attrs: {interesting_attrs}")
 
+    # ===== STEP 6: START THE AGENT SESSION =====
     try:
         await _log("info", "[SESSION] >>> Calling session.start() (with 30s hang timeout) <<<")
         try:
@@ -266,7 +340,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     except Exception as exc:
         await _log("warning", f"[SESSION] Could not introspect session state: {exc}")
 
-    # ===== WAIT UNTIL THE SESSION IS ACTUALLY RUNNING =====
+    # ===== STEP 7: WAIT UNTIL THE SESSION IS ACTUALLY RUNNING =====
     async def _wait_session_ready(timeout: float = 15.0) -> bool:
         deadline = time.time() + timeout
         last_seen = None
@@ -299,76 +373,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         for attr in ("state", "is_running", "_started", "_running", "started", "_main_task", "_task", "_closed"):
             if hasattr(session, attr):
                 await _log("error", f"[SESSION] final session.{attr} = {getattr(session, attr)!r}")
-
-    # ===== NOW DIAL THE OUTBOUND SIP CALL =====
-    if phone_number:
-        trunk_id = os.getenv("TWILIO_TRUNK_SID", "") or os.getenv("OUTBOUND_TRUNK_ID", "")
-        if not trunk_id:
-            await _log("error", "[SIP] TWILIO_TRUNK_SID not set - cannot place outbound call")
-            ctx.shutdown()
-            return
-        try:
-            await _log("info", f"[SIP] Dialing {phone_number} via trunk {trunk_id}")
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=sip_identity,
-                    wait_until_answered=True,
-                )
-            )
-            await _log("info", f"[SIP] Call answered by {phone_number}")
-        except Exception as exc:
-            await _log("error", f"[SIP] Dial failed for {phone_number}: {exc}", traceback.format_exc())
-            ctx.shutdown()
-            return
-
-        # Wait for the SIP participant to actually join the room
-        try:
-            await asyncio.wait_for(sip_participant_joined.wait(), timeout=10.0)
-            await _log("info", f"[ROOM] SIP participant {sip_identity} confirmed in room")
-        except asyncio.TimeoutError:
-            await _log("warning", f"[ROOM] SIP participant {sip_identity} did not appear within 10s - continuing")
-
-        # Wait for the SIP audio track subscription (the actual audio pipeline)
-        try:
-            await asyncio.wait_for(sip_audio_subscribed.wait(), timeout=10.0)
-            await _log("info", "[ROOM] SIP audio track subscribed - audio pipeline active")
-        except asyncio.TimeoutError:
-            await _log("warning", "[ROOM] SIP audio track not subscribed within 10s - continuing")
-
-    if phone_number:
-        aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-        aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        aws_bucket = os.getenv("S3_BUCKET", "")
-        s3_endpoint = os.getenv("S3_ENDPOINT_URL", "")
-        s3_region = os.getenv("S3_REGION", "ap-northeast-1")
-        if aws_key and aws_secret and aws_bucket:
-            try:
-                recording_path = f"recordings/{ctx.room.name}.ogg"
-                await ctx.api.egress.start_room_composite_egress(
-                    api.RoomCompositeEgressRequest(
-                        room_name=ctx.room.name,
-                        audio_only=True,
-                        file_outputs=[
-                            api.EncodedFileOutput(
-                                file_type=api.EncodedFileType.OGG,
-                                filepath=recording_path,
-                                s3=api.S3Upload(
-                                    access_key=aws_key,
-                                    secret=aws_secret,
-                                    bucket=aws_bucket,
-                                    region=s3_region,
-                                    endpoint=s3_endpoint,
-                                ),
-                            )
-                        ],
-                    )
-                )
-                tool_ctx.recording_url = f"{s3_endpoint.rstrip('/')}/{aws_bucket}/{recording_path}" if s3_endpoint else f"s3://{aws_bucket}/{recording_path}"
-            except Exception as exc:
-                await _log("warning", f"Recording start failed: {exc}")
 
     # Always trigger first reply so the AI speaks first.
     # Realtime models like gemini-2.0-flash-live-001 also need this kick-off,
