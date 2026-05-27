@@ -19,9 +19,6 @@ DEFAULTS = {
     "DEFAULT_TRANSFER_NUMBER": os.getenv("DEFAULT_TRANSFER_NUMBER", ""),
     "SUPABASE_URL": os.getenv("SUPABASE_URL", ""),
     "SUPABASE_SERVICE_KEY": os.getenv("SUPABASE_SERVICE_KEY", ""),
-    "CALCOM_API_KEY": os.getenv("CALCOM_API_KEY", ""),
-    "CALCOM_BOOKING_URL": os.getenv("CALCOM_BOOKING_URL", "https://cal.id/graviton/aicaller"),
-    "CALCOM_TIMEZONE": os.getenv("CALCOM_TIMEZONE", "America/Chicago"),
     "DEEPGRAM_API_KEY": os.getenv("DEEPGRAM_API_KEY", ""),
 }
 
@@ -35,7 +32,7 @@ SUPABASE_KEY = _default("SUPABASE_SERVICE_KEY")
 
 SENSITIVE_KEYS = {
     "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "GOOGLE_API_KEY", "TWILIO_AUTH_TOKEN", "SUPABASE_SERVICE_KEY",
-    "AWS_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "CALCOM_API_KEY", "DEEPGRAM_API_KEY",
+    "AWS_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "DEEPGRAM_API_KEY",
 }
 
 ENV_ALIASES = {
@@ -73,8 +70,7 @@ async def get_all_settings() -> dict:
         "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "GOOGLE_API_KEY", "GEMINI_MODEL", "GEMINI_TTS_VOICE",
         "USE_GEMINI_REALTIME", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "TWILIO_TRUNK_SID",
         "DEFAULT_TRANSFER_NUMBER", "SUPABASE_URL", "OUTBOUND_TRUNK_ID", "DEEPGRAM_API_KEY", "S3_ACCESS_KEY_ID",
-        "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL", "S3_REGION", "S3_BUCKET", "CALCOM_API_KEY", "CALCOM_EVENT_TYPE_ID",
-        "CALCOM_BOOKING_URL", "CALCOM_TIMEZONE", "ENABLED_TOOLS", "SYSTEM_PROMPT",
+        "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL", "S3_REGION", "S3_BUCKET", "ENABLED_TOOLS", "SYSTEM_PROMPT",
     ]
     out = {}
     for k in KNOWN_KEYS:
@@ -117,9 +113,6 @@ def validate_runtime_config() -> list[str]:
         "TWILIO_TRUNK_SID",
         "SUPABASE_URL",
         "SUPABASE_SERVICE_KEY",
-        "CALCOM_API_KEY",
-        "CALCOM_BOOKING_URL",
-        "CALCOM_TIMEZONE",
     ]
     missing = [key for key in required if not os.getenv(key, "").strip()]
     if missing:
@@ -161,11 +154,10 @@ async def insert_appointment(
     date: str,
     time: str,
     service: str,
-    calcom_booking_uid: Optional[str] = None,
     timezone: str = "America/Chicago",
-    synced_to_calcom: bool = False,
-    booking_source: str = "calcom",
+    booking_source: str = "supabase_mvp",
     status: str = "booked",
+    business_name: Optional[str] = None,
 ) -> str:
     full_id = str(uuid.uuid4())
     db = await _adb()
@@ -179,31 +171,19 @@ async def insert_appointment(
         "status": status,
         "created_at": datetime.now().isoformat(),
         "timezone": timezone,
-        "synced_to_calcom": 1 if synced_to_calcom else 0,
         "booking_source": booking_source,
     }
-    if calcom_booking_uid:
-        row["calcom_booking_uid"] = calcom_booking_uid
+    if business_name:
+        row["business_name"] = business_name
     await db.table("appointments").insert(row).execute()
     return full_id[:8].upper()
 
 
-async def check_slot(date: str, time: str) -> bool:
+async def get_booked_slots_for_date(date: str) -> list:
+    """Return all booked appointment slots for a given date."""
     db = await _adb()
-    result = await db.table("appointments").select("id").eq("date", date).eq("time", time).eq("status", "booked").maybe_single().execute()
-    return result.data is None
-
-
-async def get_next_available(date: str, time: str) -> str:
-    try:
-        dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        dt = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    for _ in range(7 * 24):
-        dt += timedelta(hours=1)
-        if 9 <= dt.hour < 18 and await check_slot(dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")):
-            return f"{dt.strftime('%Y-%m-%d')} at {dt.strftime('%H:%M')}"
-    return "no open slots found in the next 7 days"
+    result = await db.table("appointments").select("time").eq("date", date).eq("status", "booked").execute()
+    return result.data or []
 
 
 async def get_all_appointments(date_filter: Optional[str] = None) -> list:

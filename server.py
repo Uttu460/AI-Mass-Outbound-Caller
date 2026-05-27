@@ -58,8 +58,6 @@ from db import (
 )
 from prompts import DEFAULT_SYSTEM_PROMPT
 
-CALCOM_BOOKING_VERSION = "2024-08-13"
-CALCOM_CANCEL_VERSION = "2026-02-25"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
@@ -262,23 +260,6 @@ async def api_get_appointments(date: Optional[str] = None):
 
 @app.delete("/api/appointments/{appointment_id}")
 async def api_cancel_appointment(appointment_id: str):
-    appointment = await get_appointment(appointment_id)
-    if appointment and appointment.get("calcom_booking_uid"):
-        api_key = await eff("CALCOM_API_KEY")
-        if api_key:
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    await client.post(
-                        f"https://api.cal.com/v2/bookings/{appointment['calcom_booking_uid']}/cancel",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "cal-api-version": CALCOM_CANCEL_VERSION,
-                            "Content-Type": "application/json",
-                        },
-                        json={"cancellationReason": "Cancelled from OutboundAI dashboard"},
-                    )
-            except Exception as exc:
-                await log_error("server", "Cal.com cancellation failed", str(exc), "warning")
     if not await cancel_appointment(appointment_id):
         raise HTTPException(404, "Appointment not found or already cancelled")
     return {"status": "cancelled"}
