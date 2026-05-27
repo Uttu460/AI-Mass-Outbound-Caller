@@ -163,16 +163,79 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await _log("error", "[ROOM] ctx.connect() FAILED", traceback.format_exc())
         raise
 
-    # Subscribe to room events for visibility
+    # Track SIP participant + audio track readiness via asyncio events
+    sip_identity = f"sip_{phone_number}" if phone_number else None
+    sip_participant_joined = asyncio.Event()
+    sip_audio_subscribed = asyncio.Event()
+
     def _on_participant_connected(p: rtc.RemoteParticipant):
         logger.info(f"[ROOM] Participant connected: {p.identity} (kind={p.kind})")
+        if sip_identity and p.identity == sip_identity:
+            sip_participant_joined.set()
 
     def _on_track_subscribed(track, publication, p: rtc.RemoteParticipant):
         logger.info(f"[ROOM] Track subscribed from {p.identity}: kind={track.kind} sid={publication.sid}")
+        if sip_identity and p.identity == sip_identity and track.kind == rtc.TrackKind.KIND_AUDIO:
+            sip_audio_subscribed.set()
 
     ctx.room.on("participant_connected", _on_participant_connected)
     ctx.room.on("track_subscribed", _on_track_subscribed)
 
+    # ===== BUILD + START THE AGENT SESSION FIRST (before SIP dial) =====
+    try:
+        session = _build_session(tool_ctx.build_tool_list(enabled_tools), system_prompt)
+        await _log("info", "[SESSION] AgentSession built successfully")
+    except Exception as exc:
+        await _log("error", "[SESSION] Failed to build AgentSession", traceback.format_exc())
+        raise
+
+    if _HAS_ROOM_OPTIONS:
+        from livekit.agents import RoomOptions as _RO
+
+        session_kwargs = {
+            "room": ctx.room,
+            "agent": OutboundAssistant(instructions=system_prompt),
+            "room_options": _RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
+        }
+    else:
+        session_kwargs = {
+            "room": ctx.room,
+            "agent": OutboundAssistant(instructions=system_prompt),
+            "room_input_options": RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+        }
+    try:
+        await _log("info", "[SESSION] Calling session.start()...")
+        await session.start(**session_kwargs)
+        await _log("info", "[SESSION] session.start() returned")
+    except Exception as exc:
+        await _log("error", "[SESSION] session.start() FAILED", traceback.format_exc())
+        raise
+
+    # ===== WAIT UNTIL THE SESSION IS ACTUALLY RUNNING =====
+    async def _wait_session_ready(timeout: float = 10.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            # Probe a few common readiness attributes across livekit-agents versions
+            for attr in ("is_running", "_started", "_running", "started"):
+                val = getattr(session, attr, None)
+                if isinstance(val, bool) and val:
+                    return True
+                if hasattr(val, "is_set") and val.is_set():
+                    return True
+            # No reliable attribute? Just give it a tick.
+            await asyncio.sleep(0.1)
+            # If no detectable readiness flag exists, assume ready after one tick
+            if not any(hasattr(session, a) for a in ("is_running", "_started", "_running", "started")):
+                return True
+        return False
+
+    ready = await _wait_session_ready(timeout=10.0)
+    if ready:
+        await _log("info", "[SESSION] AgentSession is RUNNING and ready for input")
+    else:
+        await _log("warning", "[SESSION] Could not confirm AgentSession readiness within 10s - continuing anyway")
+
+    # ===== NOW DIAL THE OUTBOUND SIP CALL =====
     if phone_number:
         trunk_id = os.getenv("TWILIO_TRUNK_SID", "") or os.getenv("OUTBOUND_TRUNK_ID", "")
         if not trunk_id:
@@ -186,7 +249,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     room_name=ctx.room.name,
                     sip_trunk_id=trunk_id,
                     sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}",
+                    participant_identity=sip_identity,
                     wait_until_answered=True,
                 )
             )
@@ -196,33 +259,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             ctx.shutdown()
             return
 
-    try:
-        session = _build_session(tool_ctx.build_tool_list(enabled_tools), system_prompt)
-        await _log("info", "[SESSION] AgentSession built successfully")
-    except Exception as exc:
-        await _log("error", "[SESSION] Failed to build AgentSession", traceback.format_exc())
-        raise
+        # Wait for the SIP participant to actually join the room
+        try:
+            await asyncio.wait_for(sip_participant_joined.wait(), timeout=10.0)
+            await _log("info", f"[ROOM] SIP participant {sip_identity} confirmed in room")
+        except asyncio.TimeoutError:
+            await _log("warning", f"[ROOM] SIP participant {sip_identity} did not appear within 10s - continuing")
 
-    if _HAS_ROOM_OPTIONS:
-        from livekit.agents import RoomOptions as _RO
-
-        kwargs = {
-            "room": ctx.room,
-            "agent": OutboundAssistant(instructions=system_prompt),
-            "room_options": _RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
-        }
-    else:
-        kwargs = {
-            "room": ctx.room,
-            "agent": OutboundAssistant(instructions=system_prompt),
-            "room_input_options": RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
-        }
-    try:
-        await session.start(**kwargs)
-        await _log("info", "[SESSION] AgentSession.start() returned successfully - agent is live in room")
-    except Exception as exc:
-        await _log("error", "[SESSION] AgentSession.start() FAILED", traceback.format_exc())
-        raise
+        # Wait for the SIP audio track subscription (the actual audio pipeline)
+        try:
+            await asyncio.wait_for(sip_audio_subscribed.wait(), timeout=10.0)
+            await _log("info", "[ROOM] SIP audio track subscribed - audio pipeline active")
+        except asyncio.TimeoutError:
+            await _log("warning", "[ROOM] SIP audio track not subscribed within 10s - continuing")
 
     if phone_number:
         aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -259,17 +308,35 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Always trigger first reply so the AI speaks first.
     # Realtime models like gemini-3.1-flash-live-preview also need this kick-off,
     # otherwise they sit silent waiting for user audio.
-    try:
-        await _log("info", "[SESSION] Triggering initial agent greeting via generate_reply()")
-        await session.generate_reply(
-            instructions=f"The call just connected. Speak first immediately - greet the lead and ask if you're speaking with someone from {business_name}."
-        )
-        await _log("info", "[SESSION] Initial generate_reply() returned")
-    except Exception as exc:
-        await _log("warning", f"[SESSION] Initial generate_reply failed: {exc}", traceback.format_exc())
+    greet_instructions = (
+        f"The call just connected. Speak first immediately - greet the lead "
+        f"and ask if you're speaking with someone from {business_name}."
+    )
+    max_attempts = 5
+    backoff = 0.5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await _log("info", f"[SESSION] generate_reply() attempt {attempt}/{max_attempts}")
+            await session.generate_reply(instructions=greet_instructions)
+            await _log("info", "[SESSION] Initial generate_reply() returned successfully")
+            break
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "isn't running" in msg or "not running" in msg or "not started" in msg:
+                await _log("warning", f"[SESSION] Session not ready yet (attempt {attempt}): {exc}. Retrying in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 4.0)
+                continue
+            await _log("error", f"[SESSION] generate_reply RuntimeError: {exc}", traceback.format_exc())
+            break
+        except Exception as exc:
+            await _log("warning", f"[SESSION] generate_reply failed (attempt {attempt}): {exc}", traceback.format_exc())
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 4.0)
+    else:
+        await _log("error", f"[SESSION] generate_reply() never succeeded after {max_attempts} attempts")
 
     done = asyncio.Event()
-    sip_identity = f"sip_{phone_number}" if phone_number else None
 
     def _on_participant_disconnected(participant: rtc.RemoteParticipant):
         if sip_identity and participant.identity == sip_identity:
