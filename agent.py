@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import ssl
+import time
+import traceback
 from typing import Optional
 
 import certifi
@@ -38,7 +40,9 @@ logger = logging.getLogger("outbound-agent")
 
 
 async def _log(level: str, msg: str, detail: str = "") -> None:
-    getattr(logger, level if level in {"info", "warning", "error"} else "info")(msg)
+    getattr(logger, level if level in {"info", "warning", "error"} else "info")(
+        f"{msg}" + (f" | {detail}" if detail else "")
+    )
     try:
         await log_error("agent", msg, detail, level)
     except Exception:
@@ -105,7 +109,10 @@ class OutboundAssistant(Agent):
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
-    await _log("info", f"Job started - room: {ctx.room.name}")
+    await _log("info", f"[STARTUP] Worker entrypoint invoked - room: {ctx.room.name}")
+    await _log("info", f"[STARTUP] LiveKit URL: {os.getenv('LIVEKIT_URL', '<unset>')}")
+    await _log("info", f"[STARTUP] GEMINI_MODEL: {os.getenv('GEMINI_MODEL', '<unset>')}")
+    await _log("info", f"[STARTUP] USE_GEMINI_REALTIME: {os.getenv('USE_GEMINI_REALTIME', 'true')}")
     phone_number: Optional[str] = None
     lead_name = "there"
     business_name = "our company"
@@ -149,15 +156,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             pass
 
     tool_ctx = AppointmentTools(ctx, phone_number, lead_name, business_name)
-    await ctx.connect()
+    try:
+        await ctx.connect()
+        await _log("info", f"[ROOM] Connected to LiveKit room: {ctx.room.name}")
+    except Exception as exc:
+        await _log("error", "[ROOM] ctx.connect() FAILED", traceback.format_exc())
+        raise
+
+    # Subscribe to room events for visibility
+    def _on_participant_connected(p: rtc.RemoteParticipant):
+        logger.info(f"[ROOM] Participant connected: {p.identity} (kind={p.kind})")
+
+    def _on_track_subscribed(track, publication, p: rtc.RemoteParticipant):
+        logger.info(f"[ROOM] Track subscribed from {p.identity}: kind={track.kind} sid={publication.sid}")
+
+    ctx.room.on("participant_connected", _on_participant_connected)
+    ctx.room.on("track_subscribed", _on_track_subscribed)
 
     if phone_number:
         trunk_id = os.getenv("TWILIO_TRUNK_SID", "") or os.getenv("OUTBOUND_TRUNK_ID", "")
         if not trunk_id:
-            await _log("error", "TWILIO_TRUNK_SID not set - cannot place outbound call")
+            await _log("error", "[SIP] TWILIO_TRUNK_SID not set - cannot place outbound call")
             ctx.shutdown()
             return
         try:
+            await _log("info", f"[SIP] Dialing {phone_number} via trunk {trunk_id}")
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=ctx.room.name,
@@ -167,12 +190,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     wait_until_answered=True,
                 )
             )
+            await _log("info", f"[SIP] Call answered by {phone_number}")
         except Exception as exc:
-            await _log("error", f"SIP dial failed for {phone_number}: {exc}")
+            await _log("error", f"[SIP] Dial failed for {phone_number}: {exc}", traceback.format_exc())
             ctx.shutdown()
             return
 
-    session = _build_session(tool_ctx.build_tool_list(enabled_tools), system_prompt)
+    try:
+        session = _build_session(tool_ctx.build_tool_list(enabled_tools), system_prompt)
+        await _log("info", "[SESSION] AgentSession built successfully")
+    except Exception as exc:
+        await _log("error", "[SESSION] Failed to build AgentSession", traceback.format_exc())
+        raise
+
     if _HAS_ROOM_OPTIONS:
         from livekit.agents import RoomOptions as _RO
 
@@ -187,7 +217,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             "agent": OutboundAssistant(instructions=system_prompt),
             "room_input_options": RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
         }
-    await session.start(**kwargs)
+    try:
+        await session.start(**kwargs)
+        await _log("info", "[SESSION] AgentSession.start() returned successfully - agent is live in room")
+    except Exception as exc:
+        await _log("error", "[SESSION] AgentSession.start() FAILED", traceback.format_exc())
+        raise
 
     if phone_number:
         aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -221,12 +256,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             except Exception as exc:
                 await _log("warning", f"Recording start failed: {exc}")
 
-    active_model = os.getenv("GEMINI_MODEL", "")
-    if "3.1" not in active_model and "2.5" not in active_model:
-        try:
-            await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
-        except Exception as exc:
-            await _log("warning", f"generate_reply failed: {exc}")
+    # Always trigger first reply so the AI speaks first.
+    # Realtime models like gemini-3.1-flash-live-preview also need this kick-off,
+    # otherwise they sit silent waiting for user audio.
+    try:
+        await _log("info", "[SESSION] Triggering initial agent greeting via generate_reply()")
+        await session.generate_reply(
+            instructions=f"The call just connected. Speak first immediately - greet the lead and ask if you're speaking with someone from {business_name}."
+        )
+        await _log("info", "[SESSION] Initial generate_reply() returned")
+    except Exception as exc:
+        await _log("warning", f"[SESSION] Initial generate_reply failed: {exc}", traceback.format_exc())
 
     done = asyncio.Event()
     sip_identity = f"sip_{phone_number}" if phone_number else None
@@ -241,23 +281,25 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     ctx.room.on("participant_disconnected", _on_participant_disconnected)
     ctx.room.on("disconnected", _on_disconnected)
 
-    # --- Silence watchdog: auto-end call if no activity for SILENCE_TIMEOUT_SECONDS ---
-    SILENCE_TIMEOUT_SECONDS = float(os.getenv("CALL_SILENCE_TIMEOUT", "12"))
+    # --- Silence watchdog: auto-end call after inactivity, but ONLY after agent has spoken at least once ---
+    SILENCE_TIMEOUT_SECONDS = float(os.getenv("CALL_SILENCE_TIMEOUT", "15"))
+    AGENT_FIRST_SPEECH_TIMEOUT = float(os.getenv("AGENT_FIRST_SPEECH_TIMEOUT", "30"))
     silence_task: Optional[asyncio.Task] = None
+    agent_has_spoken = False
     loop = asyncio.get_event_loop()
 
-    async def _silence_watchdog():
+    async def _silence_watchdog(timeout: float, reason: str):
         try:
-            await asyncio.sleep(SILENCE_TIMEOUT_SECONDS)
-            await _log("info", f"Silence watchdog fired after {SILENCE_TIMEOUT_SECONDS}s - ending call")
+            await asyncio.sleep(timeout)
+            await _log("info", f"[WATCHDOG] Fired after {timeout}s ({reason}) - ending call")
             try:
                 from db import log_call as _log_call
                 await _log_call(
                     phone_number=phone_number or "unknown",
                     lead_name=lead_name,
                     outcome="silence_timeout",
-                    reason="no activity after final response",
-                    duration_seconds=int(__import__("time").time() - tool_ctx._call_start_time),
+                    reason=reason,
+                    duration_seconds=int(time.time() - tool_ctx._call_start_time),
                     recording_url=tool_ctx.recording_url,
                 )
             except Exception:
@@ -271,17 +313,50 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             return
 
     def _reset_silence_timer(*_args, **_kwargs):
-        nonlocal silence_task
+        nonlocal silence_task, agent_has_spoken
+        # Detect agent speech via state changes
+        for arg in _args:
+            arg_str = str(arg).lower()
+            if "agent" in arg_str and ("speaking" in arg_str or "thinking" in arg_str):
+                agent_has_spoken = True
         if silence_task and not silence_task.done():
             silence_task.cancel()
-        silence_task = loop.create_task(_silence_watchdog())
+        if agent_has_spoken:
+            silence_task = loop.create_task(_silence_watchdog(SILENCE_TIMEOUT_SECONDS, "no activity after agent response"))
 
-    for event_name in ("conversation_item_added", "agent_state_changed", "user_state_changed", "user_input_transcribed"):
+    def _on_conv_item(*args, **kwargs):
+        nonlocal agent_has_spoken
+        agent_has_spoken = True
+        logger.info(f"[CONV] conversation_item_added args={args!r} kwargs={kwargs!r}")
+        _reset_silence_timer(*args, **kwargs)
+
+    def _on_agent_state(*args, **kwargs):
+        logger.info(f"[STATE] agent_state_changed args={args!r}")
+        _reset_silence_timer(*args, **kwargs)
+
+    def _on_user_state(*args, **kwargs):
+        logger.info(f"[STATE] user_state_changed args={args!r}")
+        _reset_silence_timer(*args, **kwargs)
+
+    def _on_user_transcript(*args, **kwargs):
+        logger.info(f"[STT] user_input_transcribed args={args!r}")
+        _reset_silence_timer(*args, **kwargs)
+
+    handlers = {
+        "conversation_item_added": _on_conv_item,
+        "agent_state_changed": _on_agent_state,
+        "user_state_changed": _on_user_state,
+        "user_input_transcribed": _on_user_transcript,
+    }
+    for event_name, handler in handlers.items():
         try:
-            session.on(event_name, _reset_silence_timer)
-        except Exception:
-            pass
-    _reset_silence_timer()
+            session.on(event_name, handler)
+            logger.info(f"[SESSION] Subscribed to event: {event_name}")
+        except Exception as exc:
+            logger.warning(f"[SESSION] Could not subscribe to {event_name}: {exc}")
+
+    # Initial grace period: give the agent up to AGENT_FIRST_SPEECH_TIMEOUT seconds to speak first.
+    silence_task = loop.create_task(_silence_watchdog(AGENT_FIRST_SPEECH_TIMEOUT, "agent never spoke first"))
     try:
         await asyncio.wait_for(done.wait(), timeout=3600)
     except asyncio.TimeoutError:
@@ -290,7 +365,27 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
 if __name__ == "__main__":
+    print("=" * 60, flush=True)
+    print("[BOOT] OutboundAI LiveKit Agent Worker starting...", flush=True)
+    print(f"[BOOT] LIVEKIT_URL={os.getenv('LIVEKIT_URL', '<unset>')}", flush=True)
+    print(f"[BOOT] GEMINI_MODEL={os.getenv('GEMINI_MODEL', '<unset>')}", flush=True)
+    print(f"[BOOT] USE_GEMINI_REALTIME={os.getenv('USE_GEMINI_REALTIME', 'true')}", flush=True)
+    print("=" * 60, flush=True)
+
+    # Verbose logging for diagnostics
+    logging.getLogger("livekit").setLevel(logging.INFO)
+    logging.getLogger("livekit.agents").setLevel(logging.INFO)
+    logging.getLogger("livekit.plugins.google").setLevel(logging.INFO)
+
     init_db()
     if validate_runtime_config():
+        print("[BOOT] FATAL: missing required environment variables - aborting worker", flush=True)
         raise SystemExit(1)
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+
+    print("[BOOT] Registering worker with LiveKit (agent_name=outbound-caller)...", flush=True)
+    try:
+        agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+    except Exception:
+        print("[BOOT] Worker crashed with exception:", flush=True)
+        traceback.print_exc()
+        raise

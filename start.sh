@@ -22,12 +22,26 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 
 echo "Starting LiveKit agent worker..."
-python agent.py start &
+python -u agent.py start &
 AGENT_PID=$!
+
+sleep 3
+if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+  echo "FATAL: LiveKit agent worker failed to start (exited within 3 seconds)"
+  exit 1
+fi
+echo "LiveKit agent worker is running (PID=$AGENT_PID)"
 
 while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$AGENT_PID" 2>/dev/null; do
   sleep 2
 done
+
+if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+  echo "WARNING: LiveKit agent worker has died"
+fi
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "WARNING: FastAPI server has died"
+fi
 
 EXIT_CODE=0
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
