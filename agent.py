@@ -129,7 +129,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         except Exception:
             await _log("warning", "Invalid JSON in job metadata")
 
-    system_prompt = build_prompt(lead_name=lead_name, business_name=business_name, service_type=service_type, custom_prompt=custom_prompt)
+    system_prompt = build_prompt(
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+        phone=phone_number or "",
+        custom_prompt=custom_prompt,
+    )
     if voice_override:
         os.environ["GEMINI_TTS_VOICE"] = voice_override
     if model_override:
