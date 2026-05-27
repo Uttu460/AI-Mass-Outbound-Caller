@@ -240,6 +240,48 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     ctx.room.on("participant_disconnected", _on_participant_disconnected)
     ctx.room.on("disconnected", _on_disconnected)
+
+    # --- Silence watchdog: auto-end call if no activity for SILENCE_TIMEOUT_SECONDS ---
+    SILENCE_TIMEOUT_SECONDS = float(os.getenv("CALL_SILENCE_TIMEOUT", "12"))
+    silence_task: Optional[asyncio.Task] = None
+    loop = asyncio.get_event_loop()
+
+    async def _silence_watchdog():
+        try:
+            await asyncio.sleep(SILENCE_TIMEOUT_SECONDS)
+            await _log("info", f"Silence watchdog fired after {SILENCE_TIMEOUT_SECONDS}s - ending call")
+            try:
+                from db import log_call as _log_call
+                await _log_call(
+                    phone_number=phone_number or "unknown",
+                    lead_name=lead_name,
+                    outcome="silence_timeout",
+                    reason="no activity after final response",
+                    duration_seconds=int(__import__("time").time() - tool_ctx._call_start_time),
+                    recording_url=tool_ctx.recording_url,
+                )
+            except Exception:
+                pass
+            try:
+                await ctx.room.disconnect()
+            except Exception:
+                pass
+            done.set()
+        except asyncio.CancelledError:
+            return
+
+    def _reset_silence_timer(*_args, **_kwargs):
+        nonlocal silence_task
+        if silence_task and not silence_task.done():
+            silence_task.cancel()
+        silence_task = loop.create_task(_silence_watchdog())
+
+    for event_name in ("conversation_item_added", "agent_state_changed", "user_state_changed", "user_input_transcribed"):
+        try:
+            session.on(event_name, _reset_silence_timer)
+        except Exception:
+            pass
+    _reset_silence_timer()
     try:
         await asyncio.wait_for(done.wait(), timeout=3600)
     except asyncio.TimeoutError:
